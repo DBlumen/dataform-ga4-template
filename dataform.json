@@ -1,0 +1,9 @@
+{
+  "defaultSchema": "ga4_flattened_staging",
+  "assertionSchema": "dataform_assertions",
+  "defaultDatabase": "YOUR_GCP_PROJECT_ID",
+  "defaultLocation": "EU",
+  "vars": {
+    "timezone": "Europe/Budapest"
+  }
+}
