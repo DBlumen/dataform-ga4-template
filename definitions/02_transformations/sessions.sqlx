@@ -1,0 +1,346 @@
+-- =============================================================================
+-- sessions.sqlx
+-- -----------------------------------------------------------------------------
+-- Silver layer: one row per session, built directly on top of the staging
+-- flat table (ga4_events_flat). A direct dependent of 01_staging.
+--
+-- Merges three approaches:
+--   * ga4bigquery.com  -> CTE structure, page/device/geo/ecommerce aggregation
+--   * Default Session Schema Mod -> custom 3-condition engaged session logic
+--   * Tanelytics       -> struct-based first/last traffic source +
+--                         30-day last-non-direct attribution
+--
+-- Traffic source: the staging table already flattened collected_traffic_source
+-- into plain string columns. We REBUILD the struct here from those columns so
+-- the Tanelytics ARRAY_AGG(first/last by event_timestamp) method can be applied
+-- (decision: keep sessions a pure dependent of staging).
+--
+-- Conversions: driven by includes/conversions.js (default ['purchase']).
+--   conversions             -> count of conversion events in the session
+--   is_converting_session   -> 1 if the session had >= 1 conversion event
+--   Later models: SUM(conversions) for raw, COUNTIF(is_converting_session)
+--   / COUNT(session_id) for session conversion rate.
+--
+-- Incremental strategy: delete + checkpoint, mirroring staging. The 30-day
+-- last-non-direct lookback requires reprocessing a 30-day trailing window, so
+-- the checkpoint deletes and rebuilds the trailing window on each run.
+--
+-- Output dataset : constants.TRANSFORMATIONS_DATASET (ga4_transformations)
+-- Partition by   : session_date
+-- Cluster by     : session_source, session_medium
+-- =============================================================================
+
+config {
+  type: "incremental",
+  schema: constants.TRANSFORMATIONS_DATASET,
+  name: "sessions",
+  description: "One row per GA4 session. Built on ga4_events_flat. Tanelytics struct-based last-non-direct traffic source, custom engaged-session logic, conversions driven by includes/conversions.js.",
+  bigquery: {
+    partitionBy: "session_date",
+    clusterBy: ["session_source", "session_medium"],
+  },
+  tags: ["ga4", "transformations", "sessions"],
+}
+
+js {
+  // Lookback for last-non-direct attribution, in days (Tanelytics ~30).
+  const LOOKBACK_DAYS = 30;
+  // Trailing window (in days) reprocessed on each incremental run so the
+  // last-non-direct lookback always has enough preceding session history.
+  const REPROCESS_WINDOW_DAYS = LOOKBACK_DAYS;
+}
+
+pre_operations {
+  declare date_checkpoint default (
+    ${
+      when(incremental(),
+        `select date_sub(max(session_date), interval ${REPROCESS_WINDOW_DAYS} day) from ${self()}`,
+        `select date('${constants.START_DATE}')`)
+    }
+  )
+
+  ---
+
+  ${
+    when(incremental(),
+      `delete from ${self()} where session_date >= date_checkpoint`)
+  }
+}
+
+-- ---------------------------------------------------------------------------
+-- 1. Pull the relevant events from staging for the processing window.
+--    We rebuild the collected_traffic_source-style struct from the flat
+--    columns so we can apply the Tanelytics first/last-event logic.
+--    session_start / first_visit are excluded from traffic-source evaluation
+--    (GA4 ignores them), but kept for engagement / page metrics via the
+--    separate all_events CTE below.
+-- ---------------------------------------------------------------------------
+with traffic_events as (
+  select
+    session_id,
+    user_pseudo_id,
+    event_date,
+    event_timestamp_micros,
+    ga_session_id,
+    -- Rebuild the struct from the flat staging columns, applying the
+    -- Tanelytics gclid override (gclid present -> google / cpc).
+    if(
+      coalesce(
+        session_source, session_medium, session_campaign,
+        session_campaign_id, session_term, session_content, gclid
+      ) is not null,
+      struct(
+        session_campaign_id as manual_campaign_id,
+        session_campaign    as manual_campaign_name,
+        if(gclid is not null, 'google', session_source) as manual_source,
+        if(gclid is not null, 'cpc',    session_medium) as manual_medium,
+        session_term        as manual_term,
+        session_content     as manual_content,
+        gclid               as gclid
+      ),
+      null
+    ) as traffic_source_struct
+  from
+    ${ref("ga4_events_flat")}
+  where
+    event_date >= date_checkpoint
+    and session_id is not null
+    and event_name not in ('session_start', 'first_visit')
+),
+
+-- ---------------------------------------------------------------------------
+-- 2. First and last traffic source per session (Tanelytics method).
+--    first = source of the first event of the session
+--    last  = last non-null source of the session (used in lookback only)
+-- ---------------------------------------------------------------------------
+session_traffic as (
+  select
+    session_id,
+    user_pseudo_id,
+    min(event_date) as session_date,
+    max(ga_session_id) as ga_session_id,
+    array_agg(
+      traffic_source_struct
+      order by event_timestamp_micros asc
+      limit 1
+    )[safe_offset(0)] as session_first_traffic_source,
+    array_agg(
+      traffic_source_struct ignore nulls
+      order by event_timestamp_micros desc
+      limit 1
+    )[safe_offset(0)] as session_last_traffic_source
+  from
+    traffic_events
+  group by
+    session_id, user_pseudo_id
+),
+
+-- ---------------------------------------------------------------------------
+-- 3. Apply last-non-direct attribution (Tanelytics second query).
+--    If the session itself has a first traffic source, use it. Otherwise
+--    look back up to LOOKBACK_DAYS at the same user's previous sessions'
+--    last non-null traffic source.
+--    ga_session_id is a unix timestamp -> used for the range window.
+-- ---------------------------------------------------------------------------
+session_attribution as (
+  select
+    session_id,
+    user_pseudo_id,
+    session_date,
+    ga_session_id,
+    session_first_traffic_source,
+    coalesce(
+      session_first_traffic_source,
+      last_value(session_last_traffic_source ignore nulls) over (
+        partition by user_pseudo_id
+        order by ga_session_id
+        range between ${LOOKBACK_DAYS * 86400} preceding and 1 preceding
+      )
+    ) as session_traffic_source_last_non_direct
+  from
+    session_traffic
+),
+
+-- ---------------------------------------------------------------------------
+-- 4. All events for the window (incl. session_start/first_visit) for
+--    engagement, page, device, geo, ecommerce and conversion metrics.
+-- ---------------------------------------------------------------------------
+all_events as (
+  select
+    session_id,
+    user_pseudo_id,
+    user_id,
+    event_date,
+    event_timestamp_micros,
+    event_datetime,
+    event_name,
+    ga_session_number,
+    session_engaged,
+    engagement_time_msec,
+    page_location,
+    page_referrer,
+    page_title,
+    device_category,
+    device_os,
+    device_os_version,
+    device_language,
+    device_browser,
+    device_browser_version,
+    geo_continent,
+    geo_country,
+    geo_region,
+    geo_city,
+    event_value,
+    transaction_id,
+    currency,
+    items
+  from
+    ${ref("ga4_events_flat")}
+  where
+    event_date >= date_checkpoint
+    and session_id is not null
+),
+
+-- ---------------------------------------------------------------------------
+-- 5. Page-scoped prep: landing/exit page + page view counts per session.
+-- ---------------------------------------------------------------------------
+pages_prep as (
+  select
+    session_id,
+    page_location,
+    page_referrer,
+    row_number() over (partition by session_id order by event_timestamp_micros asc)  as pv_asc,
+    row_number() over (partition by session_id order by event_timestamp_micros desc) as pv_desc
+  from
+    all_events
+  where
+    event_name = 'page_view'
+),
+
+pages as (
+  select
+    session_id,
+    max(if(pv_asc = 1,  page_location, null)) as landing_page,
+    max(if(pv_desc = 1, page_location, null)) as exit_page,
+    max(if(pv_asc = 1,  page_referrer, null)) as page_referrer,
+    count(page_location)          as total_page_views,
+    count(distinct page_location) as unique_page_views
+  from
+    pages_prep
+  group by
+    session_id
+),
+
+-- ---------------------------------------------------------------------------
+-- 6. Custom engaged-session flag (Default Session Schema Mod):
+--    engaged if session length > 10s OR >= 2 page views OR a conversion event.
+--    Built per session so it can sit alongside the native flag.
+-- ---------------------------------------------------------------------------
+engaged_prep as (
+  select
+    session_id,
+    (max(event_timestamp_micros) - min(event_timestamp_micros)) / 1000000 as session_length_seconds,
+    countif(event_name = 'page_view')                          as page_view_count,
+    countif(event_name in (${conversions.sqlInList()}))        as conversion_event_count
+  from
+    all_events
+  group by
+    session_id
+),
+
+engaged as (
+  select
+    session_id,
+    if(
+      session_length_seconds > 10
+      or page_view_count >= 2
+      or conversion_event_count >= 1,
+      1, 0
+    ) as is_engaged_session_custom
+  from
+    engaged_prep
+)
+
+-- ---------------------------------------------------------------------------
+-- 7. Main query: one row per session, everything joined together.
+-- ---------------------------------------------------------------------------
+select
+  -- Identifiers
+  e.session_id,
+  e.user_pseudo_id,
+  max(e.user_id) as user_id,
+  att.ga_session_id,
+
+  -- Session date & timing (MIN(event_date) -> session start day)
+  min(e.event_date)                          as session_date,
+  min(e.event_datetime)                      as session_started_at,
+  max(e.event_datetime)                      as session_last_event_at,
+  timestamp_diff(max(e.event_datetime), min(e.event_datetime), second) as session_duration_seconds,
+
+  -- Session number & engagement
+  max(e.ga_session_number)                   as session_number,
+  max(e.session_engaged)                     as session_engaged_native,
+  max(eng.is_engaged_session_custom)         as is_engaged_session,
+  sum(e.engagement_time_msec) / 1000         as engagement_time_seconds,
+
+  -- Traffic source (Tanelytics last-non-direct, defaulted like GA4 UI)
+  coalesce(att.session_traffic_source_last_non_direct.manual_source,      '(direct)') as session_source,
+  coalesce(att.session_traffic_source_last_non_direct.manual_medium,      '(none)')   as session_medium,
+  coalesce(att.session_traffic_source_last_non_direct.manual_campaign_name, '(not set)') as session_campaign,
+  att.session_traffic_source_last_non_direct.manual_campaign_id          as session_campaign_id,
+  att.session_traffic_source_last_non_direct.manual_term                 as session_term,
+  att.session_traffic_source_last_non_direct.manual_content              as session_content,
+  att.session_traffic_source_last_non_direct.gclid                       as session_gclid,
+
+  -- Pages
+  max(p.landing_page)        as landing_page,
+  max(p.exit_page)           as exit_page,
+  max(p.page_referrer)       as page_referrer,
+  max(p.total_page_views)    as total_page_views,
+  max(p.unique_page_views)   as unique_page_views,
+
+  -- Device
+  max(e.device_category)         as device_category,
+  max(e.device_os)               as device_os,
+  max(e.device_os_version)       as device_os_version,
+  max(e.device_language)         as device_language,
+  max(e.device_browser)          as device_browser,
+  max(e.device_browser_version)  as device_browser_version,
+
+  -- Geo
+  max(e.geo_continent) as geo_continent,
+  max(e.geo_country)   as geo_country,
+  max(e.geo_region)    as geo_region,
+  max(e.geo_city)      as geo_city,
+
+  -- Ecommerce
+  countif(e.event_name = 'add_to_cart')       as adds_to_cart,
+  countif(e.event_name = 'begin_checkout')    as begin_checkouts,
+  countif(e.event_name = 'purchase')          as purchases,
+  count(distinct if(e.event_name = 'purchase', e.transaction_id, null)) as transactions,
+  sum(if(e.event_name = 'purchase', e.event_value, 0)) as purchase_revenue,
+  max(if(e.event_name = 'purchase', e.currency, null)) as currency,
+
+  -- Conversions (driven by includes/conversions.js)
+  countif(e.event_name in (${conversions.sqlInList()}))                  as conversions,
+  if(countif(e.event_name in (${conversions.sqlInList()})) >= 1, 1, 0)   as is_converting_session,
+
+  -- Audit
+  current_timestamp() as row_loaded_at
+
+from
+  all_events e
+  left join session_attribution att on e.session_id = att.session_id
+  left join pages p                  on e.session_id = p.session_id
+  left join engaged eng              on e.session_id = eng.session_id
+group by
+  e.session_id,
+  e.user_pseudo_id,
+  att.ga_session_id,
+  att.session_traffic_source_last_non_direct.manual_source,
+  att.session_traffic_source_last_non_direct.manual_medium,
+  att.session_traffic_source_last_non_direct.manual_campaign_name,
+  att.session_traffic_source_last_non_direct.manual_campaign_id,
+  att.session_traffic_source_last_non_direct.manual_term,
+  att.session_traffic_source_last_non_direct.manual_content,
+  att.session_traffic_source_last_non_direct.gclid
