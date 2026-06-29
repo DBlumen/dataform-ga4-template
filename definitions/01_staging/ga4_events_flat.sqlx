@@ -149,7 +149,7 @@ pre_operations {
     ${
       when(incremental(),
         `select max(event_date) + 1 from ${self()} where data_is_final = true`,
-        `select date_trunc(current_date(), year)`)
+        `select date('${constants.START_DATE}')`)
     }
   )
 
