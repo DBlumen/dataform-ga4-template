@@ -1,0 +1,90 @@
+-- =============================================================================
+-- report_events_by_page.sqlx
+-- -----------------------------------------------------------------------------
+-- Gold layer: event-level performance per page. Aggregates all default GA4
+-- events and conversions at PAGE scope (page_location / page_title).
+--
+-- Built on 01_staging (ga4_events_flat) because it needs raw event grain —
+-- the sessions table has already collapsed events to one row per session.
+--
+-- Each standard GA4 automatic / enhanced-measurement event gets its own count
+-- column. Conversions are counted from includes/conversions.js so the set
+-- stays in sync with the rest of the system.
+--
+-- Page identity: page_location (full URL). page_path / page_title available
+-- as optional dimensions. Device + geo breakdowns are commented toggles.
+--
+-- Output dataset : constants.DASHBOARDS_DATASET (ga4_dashboards)
+-- Partition by   : date
+-- Cluster by     : page_location
+-- =============================================================================
+
+config {
+  type: "table",
+  schema: constants.DASHBOARDS_DATASET,
+  name: "report_events_by_page",
+  description: "Event-level counts per page per date. All default GA4 events plus conversions (from conversions.js), aggregated at page scope from ga4_events_flat.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["page_location"],
+  },
+  tags: ["ga4", "dashboards", "report", "events", "pages"],
+}
+
+select
+  -- Dimensions
+  e.event_date                                  as date,
+  e.page_location,
+  e.page_title,
+  -- Optional breakdowns (uncomment dimension + matching group by line)
+  -- e.device_category,
+  -- e.geo_country,
+
+  -- Reach
+  count(distinct e.user_pseudo_id)              as users,
+  count(distinct e.session_id)                  as sessions,
+  count(distinct if(e.event_name = 'page_view', e.session_id, null)) as sessions_with_pageview,
+
+  -- Total activity
+  count(*)                                      as total_events,
+  countif(e.event_name = 'page_view')           as page_views,
+
+  -- Engagement / navigation events
+  countif(e.event_name = 'user_engagement')     as user_engagement,
+  countif(e.event_name = 'scroll')              as scroll,
+  countif(e.event_name = 'click')               as outbound_clicks,
+  countif(e.event_name = 'view_search_results') as view_search_results,
+  countif(e.event_name = 'file_download')       as file_downloads,
+  countif(e.event_name = 'video_start')         as video_start,
+  countif(e.event_name = 'video_progress')      as video_progress,
+  countif(e.event_name = 'video_complete')      as video_complete,
+  countif(e.event_name = 'form_start')          as form_start,
+  countif(e.event_name = 'form_submit')         as form_submit,
+
+  -- Ecommerce events (page-scoped, useful for PDP/PLP analysis)
+  countif(e.event_name = 'view_item')           as view_item,
+  countif(e.event_name = 'add_to_cart')         as add_to_cart,
+  countif(e.event_name = 'begin_checkout')      as begin_checkout,
+  countif(e.event_name = 'purchase')            as purchase,
+
+  -- Engagement time on the page (seconds)
+  safe_divide(sum(e.engagement_time_msec), 1000) as engagement_time_seconds,
+
+  -- Conversions (driven by includes/conversions.js)
+  countif(e.event_name in (${conversions.sqlInList()})) as conversions,
+
+  -- Audit
+  current_timestamp()                           as row_loaded_at
+
+from
+  ${ref("ga4_events_flat")} e
+where
+  e.page_location is not null
+group by
+  date,
+  e.page_location,
+  e.page_title
+  -- , e.device_category
+  -- , e.geo_country
+order by
+  page_views desc

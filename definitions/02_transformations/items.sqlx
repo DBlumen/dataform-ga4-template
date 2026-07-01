@@ -1,0 +1,117 @@
+-- =============================================================================
+-- items.sqlx
+-- -----------------------------------------------------------------------------
+-- Silver layer: one row per item per ecommerce event. Explodes the nested
+-- `items` ARRAY from staging (ga4_events_flat) using UNNEST.
+--
+-- Grain: item_id x event (view_item, add_to_cart, purchase, refund, ...).
+-- The 03_dashboards aggregate (report_item_performance) rolls these up per
+-- item per date with the metrics from the ga4bigquery.com item/product report:
+--   item_revenue, quantity, unique purchases, the funnel event counts, and the
+--   cart-to-detail / buy-to-detail rates.
+--
+-- Item-scoped custom dimensions live in items.item_params (added to the GA4
+-- export Oct 2023). They are exposed here as a passthrough ARRAY so client
+-- repos can unnest specific keys without changing this model.
+--
+-- Incremental strategy: delete + checkpoint, mirroring staging (3-day window).
+--
+-- Output dataset : constants.TRANSFORMATIONS_DATASET (ga4_transformations)
+-- Partition by   : event_date
+-- Cluster by     : event_name, item_id
+-- =============================================================================
+
+config {
+  type: "incremental",
+  schema: constants.TRANSFORMATIONS_DATASET,
+  name: "items",
+  description: "One row per item per ecommerce event. Explodes the items ARRAY from ga4_events_flat. Feeds the item / product performance report.",
+  bigquery: {
+    partitionBy: "event_date",
+    clusterBy: ["event_name", "item_id"],
+  },
+  tags: ["ga4", "transformations", "ecommerce", "items"],
+}
+
+js {
+  const REPROCESS_WINDOW_DAYS = 3;
+}
+
+pre_operations {
+  declare date_checkpoint default (
+    ${
+      when(incremental(),
+        `select date_sub(max(event_date), interval ${REPROCESS_WINDOW_DAYS} day) from ${self()}`,
+        `select date('${constants.START_DATE}')`)
+    }
+  )
+
+  ---
+
+  ${
+    when(incremental(),
+      `delete from ${self()} where event_date >= date_checkpoint`)
+  }
+}
+
+-- ---------------------------------------------------------------------------
+-- Explode the items array. Only ecommerce events carry items, so we restrict
+-- to the standard ecommerce event set to keep the table lean.
+-- ---------------------------------------------------------------------------
+select
+  -- Event / session context
+  e.event_date,
+  e.event_datetime,
+  e.event_name,
+  e.session_id,
+  e.user_pseudo_id,
+  e.ecommerce_transaction_id  as transaction_id,
+
+  -- Item identity
+  item.item_id,
+  item.item_name,
+  item.item_brand,
+  item.item_variant,
+  item.item_category,
+  item.item_category2,
+  item.item_category3,
+  item.item_category4,
+  item.item_category5,
+  item.item_list_id,
+  item.item_list_name,
+  item.affiliation,
+  item.location_id,
+  item.promotion_id,
+  item.promotion_name,
+
+  -- Item economics
+  item.price,
+  item.price_in_usd,
+  item.quantity,
+  item.item_revenue,
+  item.item_revenue_in_usd,
+  item.item_refund,
+  item.item_refund_in_usd,
+  item.coupon                 as item_coupon,
+
+  -- Item-scoped custom dimensions (passthrough; unnest per-client as needed)
+  item.item_params,
+
+  -- Device (event-grain, useful for product x device analysis)
+  e.device_category,
+  e.geo_country,
+
+  -- Audit
+  current_timestamp() as row_loaded_at
+
+from
+  ${ref("ga4_events_flat")} e,
+  unnest(e.items) as item
+where
+  e.event_date >= date_checkpoint
+  and e.event_name in (
+    'view_promotion', 'view_item', 'view_item_list', 'select_item',
+    'add_to_wishlist', 'add_to_cart', 'remove_from_cart', 'view_cart',
+    'begin_checkout', 'add_payment_info', 'add_shipping_info',
+    'purchase', 'refund'
+  )

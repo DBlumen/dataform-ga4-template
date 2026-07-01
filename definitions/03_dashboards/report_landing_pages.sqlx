@@ -1,0 +1,97 @@
+-- =============================================================================
+-- report_landing_pages.sqlx
+-- -----------------------------------------------------------------------------
+-- Gold layer: GA3-style landing page performance report.
+-- Built on 02_transformations/sessions (one row per session already carries
+-- landing_page, engagement, traffic source, device, geo, conversions).
+--
+-- Implements the ga4bigquery.com "Why the landing page report in GA4 sucks"
+-- metric set, at SESSION scope (one landing page per session):
+--   users, new users, sessions, % new sessions, engaged sessions,
+--   avg engagement time per session, engagement rate, conversions,
+--   conversion rate.
+--
+-- Conversions come from the sessions table's `conversions` /
+-- `is_converting_session`, which are driven by includes/conversions.js.
+--
+-- Dimensions: date + landing_page, with optional GEO and DEVICE breakdowns.
+-- Uncomment a dimension below AND its matching line in the GROUP BY to enable.
+--
+-- Output dataset : constants.DASHBOARDS_DATASET (ga4_dashboards)
+-- Partition by   : date
+-- Cluster by     : landing_page
+-- =============================================================================
+
+config {
+  type: "table",
+  schema: constants.DASHBOARDS_DATASET,
+  name: "report_landing_pages",
+  description: "GA3-style landing page performance report at session scope. Users, sessions, engagement and conversion metrics per landing page per date. Built on the sessions table.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["landing_page"],
+  },
+  tags: ["ga4", "dashboards", "report", "landing-pages"],
+}
+
+select
+  -- Dimensions
+  s.session_date                                              as date,
+  s.landing_page,
+  -- Optional breakdowns (uncomment dimension + matching group by line)
+  -- s.device_category,
+  -- s.geo_country,
+  -- s.session_source,
+  -- s.session_medium,
+
+  -- Users
+  count(distinct s.user_pseudo_id)                            as users,
+  count(distinct if(s.session_number = 1, s.user_pseudo_id, null)) as new_users,
+
+  -- Sessions
+  count(distinct s.session_id)                               as sessions,
+  safe_divide(
+    count(distinct if(s.session_number = 1, s.session_id, null)),
+    count(distinct s.session_id)
+  )                                                          as percentage_new_sessions,
+
+  -- Engagement (custom engaged-session flag from sessions table)
+  countif(s.is_engaged_session = 1)                          as engaged_sessions,
+  safe_divide(
+    sum(s.engagement_time_seconds),
+    countif(s.is_engaged_session = 1)
+  )                                                          as avg_engagement_time_per_session_seconds,
+  safe_divide(
+    countif(s.is_engaged_session = 1),
+    count(distinct s.session_id)
+  )                                                          as engagement_rate,
+
+  -- Conversions (driven by includes/conversions.js via the sessions table)
+  sum(s.conversions)                                         as conversions,
+  safe_divide(sum(s.conversions), count(distinct s.session_id)) as conversion_rate,
+  countif(s.is_converting_session = 1)                       as converting_sessions,
+  safe_divide(
+    countif(s.is_converting_session = 1),
+    count(distinct s.session_id)
+  )                                                          as session_conversion_rate,
+
+  -- Ecommerce (handy alongside landing pages for revenue-by-entry analysis)
+  sum(s.purchase_revenue)                                    as purchase_revenue,
+  countif(s.purchases > 0)                                   as purchasing_sessions,
+
+  -- Audit
+  current_timestamp()                                        as row_loaded_at
+
+from
+  ${ref("sessions")} s
+where
+  s.landing_page is not null
+group by
+  date,
+  s.landing_page
+  -- , s.device_category
+  -- , s.geo_country
+  -- , s.session_source
+  -- , s.session_medium
+order by
+  sessions desc

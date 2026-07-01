@@ -1,0 +1,95 @@
+-- =============================================================================
+-- report_conversions.sqlx
+-- -----------------------------------------------------------------------------
+-- Gold layer: conversions by session traffic source.
+--
+-- This report leans entirely on the sessions table, which already implements
+-- the Tanelytics last-non-direct attribution (collected_traffic_source rebuilt
+-- as a struct, gclid override, 30-day last-non-direct lookback). So traffic
+-- source here is GA4-UI-comparable without re-deriving anything.
+--
+-- The conversion set is driven by includes/conversions.js. Two views of
+-- conversions are provided:
+--   conversions             = SUM(sessions.conversions)        (event count)
+--   converting_sessions     = COUNTIF(is_converting_session)   (session count)
+--   session_conversion_rate = converting_sessions / sessions
+--
+-- Primary dimensions: date + source / medium / campaign.
+-- Optional GEO and DEVICE breakdowns are commented toggles.
+--
+-- Output dataset : constants.DASHBOARDS_DATASET (ga4_dashboards)
+-- Partition by   : date
+-- Cluster by     : session_source, session_medium
+-- =============================================================================
+
+config {
+  type: "table",
+  schema: constants.DASHBOARDS_DATASET,
+  name: "report_conversions",
+  description: "Conversions by last-non-direct session traffic source (Tanelytics method via the sessions table). Conversion set driven by conversions.js. Source/medium/campaign by date, with optional geo/device breakdowns.",
+  bigquery: {
+    partitionBy: "date",
+    clusterBy: ["session_source", "session_medium"],
+  },
+  tags: ["ga4", "dashboards", "report", "conversions", "traffic-source"],
+}
+
+select
+  -- Dimensions: date + traffic source (last-non-direct, from sessions)
+  s.session_date                          as date,
+  s.session_source,
+  s.session_medium,
+  s.session_campaign,
+  -- Optional breakdowns (uncomment dimension + matching group by line)
+  -- s.session_campaign_id,
+  -- s.session_term,
+  -- s.session_content,
+  -- s.device_category,
+  -- s.geo_country,
+  -- s.geo_region,
+  -- s.landing_page,
+
+  -- Reach
+  count(distinct s.user_pseudo_id)        as users,
+  count(distinct s.session_id)            as sessions,
+  countif(s.is_engaged_session = 1)       as engaged_sessions,
+  safe_divide(
+    countif(s.is_engaged_session = 1),
+    count(distinct s.session_id)
+  )                                       as engagement_rate,
+
+  -- Conversions (driven by includes/conversions.js, via the sessions table)
+  sum(s.conversions)                      as conversions,
+  safe_divide(sum(s.conversions), count(distinct s.session_id)) as conversions_per_session,
+  countif(s.is_converting_session = 1)    as converting_sessions,
+  safe_divide(
+    countif(s.is_converting_session = 1),
+    count(distinct s.session_id)
+  )                                       as session_conversion_rate,
+
+  -- Ecommerce alongside conversions (revenue per source)
+  countif(s.purchases > 0)                as purchasing_sessions,
+  sum(s.purchases)                        as purchases,
+  sum(s.transactions)                     as transactions,
+  sum(s.purchase_revenue)                 as purchase_revenue,
+  safe_divide(sum(s.purchase_revenue), count(distinct s.session_id)) as revenue_per_session,
+
+  -- Audit
+  current_timestamp()                     as row_loaded_at
+
+from
+  ${ref("sessions")} s
+group by
+  date,
+  s.session_source,
+  s.session_medium,
+  s.session_campaign
+  -- , s.session_campaign_id
+  -- , s.session_term
+  -- , s.session_content
+  -- , s.device_category
+  -- , s.geo_country
+  -- , s.geo_region
+  -- , s.landing_page
+order by
+  conversions desc

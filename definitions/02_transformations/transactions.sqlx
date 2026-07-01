@@ -1,0 +1,155 @@
+-- =============================================================================
+-- transactions.sqlx
+-- -----------------------------------------------------------------------------
+-- Silver layer: one row per purchase transaction. A direct dependent of
+-- 01_staging (ga4_events_flat), enriched with session-grain dimensions from
+-- 02_transformations/sessions (traffic source, device, geo, landing page).
+--
+-- Grain: one row per ecommerce_transaction_id (purchase event).
+-- Source of revenue/quantity: the authoritative top-level `ecommerce` STRUCT
+-- columns added to staging (ecommerce_purchase_revenue, etc), NOT the
+-- event_params values.
+--
+-- Built per the ga4bigquery.com "ecommerce transactions performance report":
+--   purchase revenue, items, refund/tax/shipping, purchasers — but kept at
+--   transaction grain here. The 03_dashboards aggregate rolls these up by date.
+--
+-- Incremental strategy: delete + checkpoint, mirroring staging (3-day window).
+--
+-- Output dataset : constants.TRANSFORMATIONS_DATASET (ga4_transformations)
+-- Partition by   : transaction_date
+-- Cluster by     : session_source, session_medium
+-- =============================================================================
+
+config {
+  type: "incremental",
+  schema: constants.TRANSFORMATIONS_DATASET,
+  name: "transactions",
+  description: "One row per GA4 purchase transaction. Built on ga4_events_flat using the top-level ecommerce struct, enriched with session-grain traffic source / device / geo from the sessions table.",
+  bigquery: {
+    partitionBy: "transaction_date",
+    clusterBy: ["session_source", "session_medium"],
+  },
+  tags: ["ga4", "transformations", "ecommerce", "transactions"],
+}
+
+js {
+  // Reprocess a trailing window on each incremental run so late-arriving
+  // purchase data (GA4's up-to-72h backfill) is captured. Mirrors staging.
+  const REPROCESS_WINDOW_DAYS = 3;
+}
+
+pre_operations {
+  declare date_checkpoint default (
+    ${
+      when(incremental(),
+        `select date_sub(max(transaction_date), interval ${REPROCESS_WINDOW_DAYS} day) from ${self()}`,
+        `select date('${constants.START_DATE}')`)
+    }
+  )
+
+  ---
+
+  ${
+    when(incremental(),
+      `delete from ${self()} where transaction_date >= date_checkpoint`)
+  }
+}
+
+-- ---------------------------------------------------------------------------
+-- 1. Purchase events from staging. One purchase event = one transaction.
+--    Dedupe defensively on ecommerce_transaction_id (GA4 can occasionally
+--    duplicate a purchase event) keeping the earliest occurrence.
+-- ---------------------------------------------------------------------------
+with purchases as (
+  select
+    e.ecommerce_transaction_id                       as transaction_id,
+    e.event_date                                     as transaction_date,
+    e.event_datetime                                 as transaction_timestamp,
+    e.session_id,
+    e.user_pseudo_id,
+    e.user_id,
+    e.ecommerce_purchase_revenue                     as purchase_revenue,
+    e.ecommerce_purchase_revenue_in_usd              as purchase_revenue_in_usd,
+    e.ecommerce_total_item_quantity                  as total_item_quantity,
+    e.ecommerce_unique_items                         as unique_items,
+    e.ecommerce_refund_value                         as refund_value,
+    e.ecommerce_tax_value                            as tax_value,
+    e.ecommerce_shipping_value                       as shipping_value,
+    e.currency,
+    e.coupon,
+    row_number() over (
+      partition by e.ecommerce_transaction_id
+      order by e.event_timestamp_micros asc
+    )                                                as txn_dedupe_rank
+  from
+    ${ref("ga4_events_flat")} e
+  where
+    e.event_date >= date_checkpoint
+    and e.event_name = 'purchase'
+    and e.ecommerce_transaction_id is not null
+    and e.ecommerce_transaction_id != '(not set)'
+)
+
+-- ---------------------------------------------------------------------------
+-- 2. Enrich with session-grain dimensions from the sessions table:
+--    Tanelytics last-non-direct traffic source, device, geo, landing page.
+-- ---------------------------------------------------------------------------
+select
+  -- Identifiers
+  p.transaction_id,
+  p.transaction_date,
+  p.transaction_timestamp,
+  p.session_id,
+  p.user_pseudo_id,
+  p.user_id,
+
+  -- Monetary values (authoritative ecommerce struct)
+  p.purchase_revenue,
+  p.purchase_revenue_in_usd,
+  p.total_item_quantity,
+  p.unique_items,
+  p.refund_value,
+  p.tax_value,
+  p.shipping_value,
+  p.currency,
+  p.coupon,
+
+  -- Traffic source (session-grain, last-non-direct from sessions)
+  s.session_source,
+  s.session_medium,
+  s.session_campaign,
+  s.session_campaign_id,
+  s.session_term,
+  s.session_content,
+  s.session_gclid,
+
+  -- Landing page of the converting session
+  s.landing_page,
+
+  -- Device (session-grain)
+  s.device_category,
+  s.device_os,
+  s.device_os_version,
+  s.device_language,
+  s.device_browser,
+  s.device_browser_version,
+
+  -- Geo (session-grain)
+  s.geo_continent,
+  s.geo_country,
+  s.geo_region,
+  s.geo_city,
+
+  -- Session context
+  s.session_number,
+  s.is_engaged_session,
+
+  -- Audit
+  current_timestamp() as row_loaded_at
+
+from
+  purchases p
+  left join ${ref("sessions")} s on p.session_id = s.session_id
+where
+  p.txn_dedupe_rank = 1

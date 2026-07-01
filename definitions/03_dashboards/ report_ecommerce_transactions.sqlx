@@ -1,0 +1,127 @@
+-- =============================================================================
+-- report_ecommerce_transactions.sqlx
+-- -----------------------------------------------------------------------------
+-- Gold layer: ecommerce transactions performance report.
+-- Aggregates 02_transformations/transactions by date.
+--
+-- Implements the ga4bigquery.com "ecommerce transactions performance report"
+-- metric set:
+--   transactions, purchase revenue, purchasers, ecommerce conversion rates
+--   (users / all sessions / engaged sessions), total & unique items,
+--   refund / tax / shipping, and the average-revenue / average-items ratios.
+--
+-- Conversion-rate denominators (users, sessions, engaged sessions) come from
+-- the sessions table for the same date range, so the rates are correct rather
+-- than self-referential to purchases.
+--
+-- Dimensions: date, with optional source / device / geo breakdowns.
+--
+-- Output dataset : constants.DASHBOARDS_DATASET (ga4_dashboards)
+-- Partition by   : date
+-- =============================================================================
+
+config {
+  type: "table",
+  schema: constants.DASHBOARDS_DATASET,
+  name: "report_ecommerce_transactions",
+  description: "Ecommerce transactions performance report aggregated by date. Revenue, transactions, purchasers, conversion rates, items, and average-value ratios. Built on the transactions + sessions tables.",
+  bigquery: {
+    partitionBy: "date",
+  },
+  tags: ["ga4", "dashboards", "report", "ecommerce", "transactions"],
+}
+
+-- ---------------------------------------------------------------------------
+-- 1. Session denominators per date (for ecommerce conversion rates).
+--    Optional breakdown columns must match between this CTE and txn below.
+-- ---------------------------------------------------------------------------
+with session_denoms as (
+  select
+    s.session_date                        as date,
+    -- , s.session_source
+    -- , s.device_category
+    -- , s.geo_country
+    count(distinct s.user_pseudo_id)      as users,
+    count(distinct s.session_id)          as sessions,
+    countif(s.is_engaged_session = 1)     as engaged_sessions
+  from
+    ${ref("sessions")} s
+  group by
+    date
+    -- , s.session_source
+    -- , s.device_category
+    -- , s.geo_country
+),
+
+-- ---------------------------------------------------------------------------
+-- 2. Transaction aggregates per date.
+-- ---------------------------------------------------------------------------
+txn as (
+  select
+    t.transaction_date                    as date,
+    -- , t.session_source
+    -- , t.device_category
+    -- , t.geo_country
+    count(distinct t.transaction_id)      as transactions,
+    sum(t.purchase_revenue)               as purchase_revenue,
+    count(distinct t.user_pseudo_id)      as purchasers,
+    sum(t.total_item_quantity)            as total_items,
+    sum(t.unique_items)                   as unique_items,
+    sum(t.refund_value)                   as refund_value,
+    sum(t.tax_value)                      as tax_value,
+    sum(t.shipping_value)                 as shipping_value
+  from
+    ${ref("transactions")} t
+  group by
+    date
+    -- , t.session_source
+    -- , t.device_category
+    -- , t.geo_country
+)
+
+-- ---------------------------------------------------------------------------
+-- 3. Combine: transaction metrics + correct session-based denominators.
+-- ---------------------------------------------------------------------------
+select
+  txn.date,
+  -- , txn.session_source / device_category / geo_country (uncomment + join key)
+
+  -- Core
+  txn.transactions,
+  txn.purchase_revenue,
+  txn.purchasers,
+
+  -- Ecommerce conversion rates (transaction count over the right denominator)
+  safe_divide(txn.transactions, d.users)            as ecommerce_conversion_rate_users,
+  safe_divide(txn.transactions, d.sessions)         as ecommerce_conversion_rate_all_sessions,
+  safe_divide(txn.transactions, d.engaged_sessions) as ecommerce_conversion_rate_engaged_sessions,
+
+  -- Items
+  txn.total_items,
+  txn.unique_items,
+
+  -- Money components
+  txn.refund_value,
+  txn.tax_value,
+  txn.shipping_value,
+
+  -- Average revenue ratios
+  safe_divide(txn.purchase_revenue, d.users)         as avg_purchase_revenue_per_user,
+  safe_divide(txn.purchase_revenue, txn.purchasers)  as avg_purchase_revenue_per_purchaser,
+  safe_divide(txn.purchase_revenue, txn.transactions) as avg_purchase_revenue_per_transaction,
+
+  -- Average items ratios
+  safe_divide(txn.total_items, txn.purchasers)       as avg_items_per_purchaser,
+  safe_divide(txn.total_items, txn.transactions)     as avg_items_per_transaction,
+  safe_divide(txn.unique_items, txn.purchasers)      as avg_unique_items_per_purchaser,
+  safe_divide(txn.unique_items, txn.transactions)    as avg_unique_items_per_transaction,
+
+  -- Audit
+  current_timestamp() as row_loaded_at
+
+from
+  txn
+  left join session_denoms d on txn.date = d.date
+    -- and txn.session_source = d.session_source  (match if breakdown enabled)
+order by
+  txn.date
