@@ -65,7 +65,7 @@ select
   e.event_name,
   e.session_id,
   e.user_pseudo_id,
-  e.ecommerce_transaction_id  as transaction_id,
+  e.transaction_id  as transaction_id,
 
   -- Item identity
   item.item_id,
